@@ -28,20 +28,23 @@ public partial class Workspace : ObservableObject
     [ObservableProperty]
     public string _progressText = "";
 
-    public ObservableCollection<WorkspaceItem> RootItems { get; } = new();
-    public Dictionary<string, WorkspaceItem> ItemLookup { get; } = new();
+    public ObservableCollection<WorkspaceItem> RootItems { get; } = [];
+    public Dictionary<string, WorkspaceItem> ItemLookup { get; } = [];
     private SynchronizationContext? FileSyncContext { get; } = SynchronizationContext.Current;
 
     // items modified and unsaved
-    public HashSet<WorkspaceItem> UnsavedItems { get; } = new();
+    public HashSet<WorkspaceItem> UnsavedItems { get; } = [];
     // items modified and saved
     // we track this since the base AssetsFile is still reading from the old file
-    public HashSet<WorkspaceItem> ModifiedItems { get; } = new();
+    public HashSet<WorkspaceItem> ModifiedItems { get; } = [];
 
     public int NextLoadIndex => RootItems.Count != 0 ? RootItems.Max(i => i.LoadIndex) + 1 : 0;
 
     public delegate void MonoTemplateFailureEvent(string path);
     public event MonoTemplateFailureEvent? MonoTemplateLoadFailed;
+
+    // keys of files we're working on but haven't been added to AssetsManager's file list yet
+    private HashSet<string> _workingKeys = [];
 
     private bool _setMonoTempGeneratorsYet;
 
@@ -100,32 +103,100 @@ public partial class Workspace : ObservableObject
             bunInst = Manager.LoadBundleFile(stream, name);
         }
 
-        TryLoadClassDatabase(bunInst.file);
+        // keys we'll add to workingKeys to "lock" them
+        var ourWorkingKeys = new List<string>();
 
-        var item = new WorkspaceItem(this, bunInst, loadOrder);
-        AddRootItemThreadSafe(item, bunInst.name);
+        // check for duplicate files
+        // we stop at the first one since any duplicates are bad
+        lock (_workingKeys)
+        {
+            var dirInfs = bunInst.file.BlockAndDirInfo.DirectoryInfos;
+            foreach (var dirInf in dirInfs)
+            {
+                var dirInfKey = AssetsManager.GetFileLookupKey(dirInf.Name);
+                if (Manager.FileLookup.ContainsKey(dirInfKey) || _workingKeys.Contains(dirInfKey))
+                {
+                    throw new DuplicateWorkspaceFileException(dirInfKey, bunInst.path);
+                }
+
+                ourWorkingKeys.Add(dirInfKey);
+            }
+
+            // no exception, so we're free to lock in these files now
+            foreach (var keyToAdd in ourWorkingKeys)
+            {
+                _workingKeys.Add(keyToAdd);
+            }
+        }
+
+        WorkspaceItem item;
+        try
+        {
+            TryLoadClassDatabase(bunInst.file);
+
+            item = new WorkspaceItem(this, bunInst, loadOrder);
+            AddRootItemThreadSafe(item, bunInst.name);
+        }
+        finally
+        {
+            // done with files, they are now part of AssetsManager
+            // so we should let it handle things from now on
+            lock (_workingKeys)
+            {
+                foreach (var keyToRemove in ourWorkingKeys)
+                {
+                    _workingKeys.Remove(keyToRemove);
+                }
+            }
+        }
 
         return item;
     }
 
     public WorkspaceItem LoadAssets(Stream stream, int loadOrder = -1, string name = "")
     {
-        AssetsFileInstance fileInst;
-        if (stream is FileStream fs)
+        // check if file is duplicate
+        var fileVirtualPath = (stream is FileStream fkfs) ? fkfs.Name : name;
+        var fileKey = AssetsManager.GetFileLookupKey(fileVirtualPath);
+
+        lock (_workingKeys)
         {
-            fileInst = Manager.LoadAssetsFile(fs);
+            if (Manager.FileLookup.ContainsKey(fileKey) || _workingKeys.Contains(fileKey))
+            {
+                throw new DuplicateWorkspaceFileException(fileVirtualPath);
+            }
+
+            // no exception, so we're free to lock in this file
+            _workingKeys.Add(fileKey);
         }
-        else
+
+        WorkspaceItem item;
+        try
         {
-            fileInst = Manager.LoadAssetsFile(stream, name);
+            AssetsFileInstance fileInst;
+            if (stream is FileStream fs)
+            {
+                fileInst = Manager.LoadAssetsFile(fs);
+            }
+            else
+            {
+                fileInst = Manager.LoadAssetsFile(stream, name);
+            }
+
+            TryLoadClassDatabase(fileInst.file);
+
+            FixupAssetsFile(fileInst);
+
+            item = new WorkspaceItem(fileInst, loadOrder);
+            AddRootItemThreadSafe(item, fileInst.name);
         }
-
-        TryLoadClassDatabase(fileInst.file);
-
-        FixupAssetsFile(fileInst);
-
-        var item = new WorkspaceItem(fileInst, loadOrder);
-        AddRootItemThreadSafe(item, fileInst.name);
+        finally
+        {
+            lock (_workingKeys)
+            {
+                _workingKeys.Remove(fileKey);
+            }
+        }
 
         return item;
     }

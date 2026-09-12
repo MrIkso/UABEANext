@@ -3,7 +3,6 @@ using AssetsTools.NET.Extra;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
-using System.Runtime.CompilerServices;
 using UABEANext4.AssetWorkspace;
 
 namespace UABEANext4.Util;
@@ -175,7 +174,8 @@ public class AssetNamer
 
                         while (iterator.ReadNext())
                         {
-                            if (iterator.TempField.Name == "m_Name" && iterator.TempField.Type == "string" && iterator.TempFieldStack[1].Name == "m_ParsedForm")
+                            if (iterator.TempField.Name == "m_Name" && iterator.TempField.Type == "string" &&
+                                iterator.TempFieldStack.Count >= 2 && iterator.TempFieldStack[1].Name == "m_ParsedForm")
                             {
                                 var valueField = iterator.ReadValueField();
                                 assetName = valueField.AsString;
@@ -290,7 +290,6 @@ public class AssetNamer
             : $"{assetName}-{Path.GetFileName(asset.FileInstance.path)}-{asset.PathId}{ext}";
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void GetLockObjAndReader(
         AssetInst asset, out object lockObj, out AssetsFileReader reader, out long pos)
     {
@@ -305,8 +304,10 @@ public class AssetNamer
         else
         {
             lockObj = fileInst.LockReader;
-            reader = asset.FileInstance.file.Reader;
-            pos = asset.AbsoluteByteStart;
+            var baseStream = asset.FileInstance.file.Reader.BaseStream;
+            var segStream = new SegmentStream(baseStream, asset.AbsoluteByteStart, asset.ByteSize);
+            reader = new AssetsFileReader(segStream);
+            pos = 0;
         }
     }
 
